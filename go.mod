@@ -4,8 +4,8 @@ go 1.22
 
 require (
 	github.com/caddyserver/caddy/v2 v2.8.4
-	github.com/fatedier/frp v0.61.0
-	github.com/fatedier/golib v0.5.0
+	github.com/fatedier/frp v0.69.1
+	github.com/fatedier/golib v0.7.0
 	go.uber.org/zap v1.27.0
 )
 
