@@ -12,7 +12,7 @@ import (
 
 // caddyLogWriter 实现 golib/log.Writer 接口,将 frp 的日志转发到 Caddy 的 zap logger。
 //
-// frp v0.61.0 使用 github.com/fatedier/golib/log 作为日志后端。
+// frp v0.69.1 使用 github.com/fatedier/golib/log 作为日志后端。
 // golib/log 的 Logger.out 字段是 io.Writer 类型,但在 log() 方法中会检查
 // 是否实现了 Writer 接口(WriteLog 方法),如果实现了就调用 WriteLog 传入级别信息。
 //
@@ -87,7 +87,7 @@ func extractMessage(msg string) string {
 // bridgeFrpLogs 将 frp 的全局日志重定向到 Caddy 的 zap logger。
 // 在每次 Provision 时调用,确保 reload 后日志仍指向当前 Caddy 实例的 logger。
 //
-// frp v0.61.0 的日志架构:
+// frp v0.69.1 的日志架构:
 //   - frp/pkg/util/log.Logger (全局单例, *golib/log.Logger)
 //   - xlog 从 context 中获取 prefix,委托给 frp/pkg/util/log.Logger
 //

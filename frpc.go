@@ -2,7 +2,7 @@
 // 无需单独运行 frpc 进程,内网穿透隧道随 Caddy 一起启动/停止。
 // 支持同时连接多个 frps 服务器,每个实例独立配置代理隧道。
 //
-// 基于 frp v0.61.0,使用 v1 config 包,所有配置通过 Caddyfile 内联定义。
+// 基于 frp v0.69.1,使用 v1 config 包,所有配置通过 Caddyfile 内联定义。
 package caddyfrpc
 
 import (
@@ -14,6 +14,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/fatedier/frp/client"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
+	"github.com/fatedier/frp/pkg/config/source"
 
 	"go.uber.org/zap"
 )
@@ -156,15 +157,26 @@ func (a *App) Provision(ctx caddy.Context) error {
 }
 
 // build 解析实例配置并创建 frp Service。
+//
+// frp v0.69.1 起,client.ServiceOptions 不再直接接收 ProxyCfgs,
+// 而是通过 ConfigSourceAggregator 提供配置源。这里使用内存型的
+// source.ConfigSource 装载代理配置,再交给 NewService 内部完成
+// Complete/Filter 流程。
 func (inst *Instance) build() error {
 	common, pxyCfgs, err := inst.buildConfig()
 	if err != nil {
 		return err
 	}
 
+	configSource := source.NewConfigSource()
+	if err := configSource.ReplaceAll(pxyCfgs, nil); err != nil {
+		return fmt.Errorf("set config source: %w", err)
+	}
+	aggregator := source.NewAggregator(configSource)
+
 	svc, err := client.NewService(client.ServiceOptions{
-		Common:    common,
-		ProxyCfgs: pxyCfgs,
+		Common:                 common,
+		ConfigSourceAggregator: aggregator,
 	})
 	if err != nil {
 		return fmt.Errorf("create service: %w", err)
@@ -205,14 +217,15 @@ func (inst *Instance) buildConfig() (*v1.ClientCommonConfig, []v1.ProxyConfigure
 		common.Transport.TLS.Enable = inst.TLSEnable
 	}
 
-	common.Complete()
+	if err := common.Complete(); err != nil {
+		return nil, nil, fmt.Errorf("complete common config: %w", err)
+	}
 
-	// proxy name 前缀: user (Complete 会自动加上 "." 分隔符)
-	namePrefix := common.User
-
+	// frp v0.69.1 起,proxy 的 user 前缀由 client 在生成 wire 消息时
+	// 通过 naming.AddUserPrefix 自动追加,这里无需再手动拼前缀。
 	var pxyCfgs []v1.ProxyConfigurer
 	for _, p := range inst.proxies {
-		pcfg, err := buildProxyConf(namePrefix, p)
+		pcfg, err := buildProxyConf(p)
 		if err != nil {
 			return nil, nil, fmt.Errorf("proxy %q: %w", p.Name, err)
 		}
@@ -223,30 +236,30 @@ func (inst *Instance) buildConfig() (*v1.ClientCommonConfig, []v1.ProxyConfigure
 }
 
 // buildProxyConf 根据类型构造对应的 v1.ProxyConfigurer 实现。
-func buildProxyConf(namePrefix string, p ProxyConfig) (v1.ProxyConfigurer, error) {
+func buildProxyConf(p ProxyConfig) (v1.ProxyConfigurer, error) {
 	if p.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
 
 	switch p.Type {
 	case "tcp":
-		return buildTCPProxy(namePrefix, p)
+		return buildTCPProxy(p)
 	case "udp":
-		return buildUDPProxy(namePrefix, p)
+		return buildUDPProxy(p)
 	case "http":
-		return buildHTTPProxy(namePrefix, p)
+		return buildHTTPProxy(p)
 	case "https":
-		return buildHTTPSProxy(namePrefix, p)
+		return buildHTTPSProxy(p)
 	case "stcp":
-		return buildSTCPProxy(namePrefix, p)
+		return buildSTCPProxy(p)
 	case "xtcp":
-		return buildXTCPProxy(namePrefix, p)
+		return buildXTCPProxy(p)
 	default:
 		return nil, fmt.Errorf("unsupported proxy type %q (supported: tcp, udp, http, https, stcp, xtcp)", p.Type)
 	}
 }
 
-func buildTCPProxy(namePrefix string, p ProxyConfig) (*v1.TCPProxyConfig, error) {
+func buildTCPProxy(p ProxyConfig) (*v1.TCPProxyConfig, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
@@ -259,11 +272,11 @@ func buildTCPProxy(namePrefix string, p ProxyConfig) (*v1.TCPProxyConfig, error)
 	cfg.LocalIP = p.LocalIP
 	cfg.LocalPort = p.LocalPort
 	cfg.RemotePort = p.RemotePort
-	cfg.Complete(namePrefix)
+	cfg.Complete()
 	return cfg, nil
 }
 
-func buildUDPProxy(namePrefix string, p ProxyConfig) (*v1.UDPProxyConfig, error) {
+func buildUDPProxy(p ProxyConfig) (*v1.UDPProxyConfig, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
@@ -276,11 +289,11 @@ func buildUDPProxy(namePrefix string, p ProxyConfig) (*v1.UDPProxyConfig, error)
 	cfg.LocalIP = p.LocalIP
 	cfg.LocalPort = p.LocalPort
 	cfg.RemotePort = p.RemotePort
-	cfg.Complete(namePrefix)
+	cfg.Complete()
 	return cfg, nil
 }
 
-func buildHTTPProxy(namePrefix string, p ProxyConfig) (*v1.HTTPProxyConfig, error) {
+func buildHTTPProxy(p ProxyConfig) (*v1.HTTPProxyConfig, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
@@ -301,11 +314,11 @@ func buildHTTPProxy(namePrefix string, p ProxyConfig) (*v1.HTTPProxyConfig, erro
 	cfg.RequestHeaders.Set = p.RequestHeaders
 	cfg.ResponseHeaders.Set = p.ResponseHeaders
 	cfg.RouteByHTTPUser = p.RouteByHTTPUser
-	cfg.Complete(namePrefix)
+	cfg.Complete()
 	return cfg, nil
 }
 
-func buildHTTPSProxy(namePrefix string, p ProxyConfig) (*v1.HTTPSProxyConfig, error) {
+func buildHTTPSProxy(p ProxyConfig) (*v1.HTTPSProxyConfig, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
@@ -319,11 +332,11 @@ func buildHTTPSProxy(namePrefix string, p ProxyConfig) (*v1.HTTPSProxyConfig, er
 	cfg.LocalPort = p.LocalPort
 	cfg.CustomDomains = p.CustomDomains
 	cfg.SubDomain = p.SubDomain
-	cfg.Complete(namePrefix)
+	cfg.Complete()
 	return cfg, nil
 }
 
-func buildSTCPProxy(namePrefix string, p ProxyConfig) (*v1.STCPProxyConfig, error) {
+func buildSTCPProxy(p ProxyConfig) (*v1.STCPProxyConfig, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
@@ -337,11 +350,11 @@ func buildSTCPProxy(namePrefix string, p ProxyConfig) (*v1.STCPProxyConfig, erro
 	cfg.LocalPort = p.LocalPort
 	cfg.Secretkey = p.SecretKey
 	cfg.AllowUsers = p.AllowUsers
-	cfg.Complete(namePrefix)
+	cfg.Complete()
 	return cfg, nil
 }
 
-func buildXTCPProxy(namePrefix string, p ProxyConfig) (*v1.XTCPProxyConfig, error) {
+func buildXTCPProxy(p ProxyConfig) (*v1.XTCPProxyConfig, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
@@ -355,7 +368,7 @@ func buildXTCPProxy(namePrefix string, p ProxyConfig) (*v1.XTCPProxyConfig, erro
 	cfg.LocalPort = p.LocalPort
 	cfg.Secretkey = p.SecretKey
 	cfg.AllowUsers = p.AllowUsers
-	cfg.Complete(namePrefix)
+	cfg.Complete()
 	return cfg, nil
 }
 
