@@ -13,8 +13,9 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/fatedier/frp/client"
-	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/config/source"
+	"github.com/fatedier/frp/pkg/config/types"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 
 	"go.uber.org/zap"
 )
@@ -37,14 +38,71 @@ type App struct {
 
 // Instance 描述一个 frps 连接定义。
 type Instance struct {
-	Name       string `json:"name,omitempty"`
+	Name string `json:"name,omitempty"`
+
+	// --- 基础连接 ---
 	ServerAddr string `json:"server_addr,omitempty"`
 	ServerPort int    `json:"server_port,omitempty"`
 	User       string `json:"user,omitempty"`
+	ClientID   string `json:"client_id,omitempty"`
+
+	// --- 认证 ---
 	Token      string `json:"token,omitempty"`
-	Protocol   string `json:"protocol,omitempty"`   // tcp (默认), kcp, quic, websocket, wss
-	TLSEnable  *bool  `json:"tls_enable,omitempty"` // nil=用默认值(true since v0.50)
-	LogLevel   string `json:"log_level,omitempty"`  // trace, debug, info, warn, error
+	AuthMethod string `json:"auth_method,omitempty"` // token (默认), oidc
+
+	// OIDC 认证参数,仅 auth_method 为 oidc 时生效。
+	OIDCClientID         string `json:"oidc_client_id,omitempty"`
+	OIDCClientSecret     string `json:"oidc_client_secret,omitempty"`
+	OIDCAudience         string `json:"oidc_audience,omitempty"`
+	OIDCScope            string `json:"oidc_scope,omitempty"`
+	OIDCTokenEndpointURL string `json:"oidc_token_endpoint_url,omitempty"`
+
+	// --- 传输层 ---
+	Protocol     string `json:"protocol,omitempty"`      // tcp (默认), kcp, quic, websocket, wss
+	WireProtocol string `json:"wire_protocol,omitempty"` // v1 (默认), v2
+
+	DialServerTimeout    int64  `json:"dial_server_timeout,omitempty"`     // 秒,默认 10
+	DialServerKeepalive  int64  `json:"dial_server_keepalive,omitempty"`   // 秒,默认 7200,负数禁用
+	ConnectServerLocalIP string `json:"connect_server_local_ip,omitempty"` // 仅 tcp/websocket 生效
+	ProxyURL             string `json:"proxy_url,omitempty"`               // 连接 frps 用的代理
+	PoolCount            int    `json:"pool_count,omitempty"`              // 预建连接数,默认 1
+
+	// --- 多路复用与心跳 ---
+	TCPMux                  *bool `json:"tcp_mux,omitempty"`                    // 默认 true
+	TCPMuxKeepaliveInterval int64 `json:"tcp_mux_keepalive_interval,omitempty"` // 秒,默认 30
+	HeartbeatInterval       int64 `json:"heartbeat_interval,omitempty"`         // 秒,tcp_mux 关闭时默认 30
+	HeartbeatTimeout        int64 `json:"heartbeat_timeout,omitempty"`          // 秒,tcp_mux 关闭时默认 90
+
+	// --- 其他连接行为 ---
+	DNSServer         string `json:"dns_server,omitempty"`
+	NatHoleSTUNServer string `json:"nat_hole_stun_server,omitempty"`
+	UDPPacketSize     int64  `json:"udp_packet_size,omitempty"` // 默认 1500
+	// LoginFailExit 默认 false(与 frp 默认的 true 相反):连接失败时重试而非退出,
+	// 这是 Caddy reload 重叠期能够平滑过渡的前提。
+	LoginFailExit *bool `json:"login_fail_exit,omitempty"`
+
+	// --- TLS ---
+	TLSEnable                 *bool  `json:"tls_enable,omitempty"` // 默认 true (frp v0.50+)
+	TLSDisableCustomFirstByte *bool  `json:"tls_disable_custom_first_byte,omitempty"`
+	TLSCertFile               string `json:"tls_cert_file,omitempty"`
+	TLSKeyFile                string `json:"tls_key_file,omitempty"`
+	TLSTrustedCaFile          string `json:"tls_trusted_ca_file,omitempty"`
+	TLSServerName             string `json:"tls_server_name,omitempty"`
+
+	// --- QUIC 专属 (protocol quic) ---
+	QUICKeepalivePeriod    int `json:"quic_keepalive_period,omitempty"`     // 秒,默认 10
+	QUICMaxIdleTimeout     int `json:"quic_max_idle_timeout,omitempty"`     // 秒,默认 30
+	QUICMaxIncomingStreams int `json:"quic_max_incoming_streams,omitempty"` // 默认 100000
+
+	// --- 管理接口 (frpc admin UI) ---
+	AdminAddr     string `json:"admin_addr,omitempty"` // 默认 127.0.0.1
+	AdminPort     int    `json:"admin_port,omitempty"` // 0 表示不启动
+	AdminUser     string `json:"admin_user,omitempty"`
+	AdminPassword string `json:"admin_password,omitempty"`
+
+	// --- 其他 ---
+	LogLevel  string            `json:"log_level,omitempty"` // trace, debug, info, warn, error
+	Metadatas map[string]string `json:"metadatas,omitempty"`
 
 	// 运行时字段 (不序列化):在 Provision 阶段从 App.Proxies 中按引用重组分配。
 	proxies []ProxyConfig
@@ -54,24 +112,25 @@ type Instance struct {
 	done    chan struct{}
 }
 
-// ProxyConfig 描述一条代理隧道,支持 tcp/udp/http/https/stcp/xtcp 类型。
+// ProxyConfig 描述一条代理隧道,支持 tcp/udp/http/https/tcpmux/stcp/xtcp/sudp 类型。
 type ProxyConfig struct {
 	// Server 指定此 proxy 所属的 server 名称。
 	Server string `json:"server,omitempty"`
 
 	Name      string `json:"name"`
-	Type      string `json:"type"` // tcp, udp, http, https, stcp, xtcp
+	Type      string `json:"type"`              // tcp, udp, http, https, tcpmux, stcp, xtcp, sudp
+	Enabled   *bool  `json:"enabled,omitempty"` // nil/true 表示启用
 	LocalIP   string `json:"local_ip,omitempty"`
 	LocalPort int    `json:"local_port"`
 
 	// tcp/udp: 远程端口
 	RemotePort int `json:"remote_port,omitempty"`
 
-	// http/https: 域名配置
+	// http/https/tcpmux: 域名配置
 	CustomDomains []string `json:"custom_domains,omitempty"`
 	SubDomain     string   `json:"sub_domain,omitempty"`
 
-	// http 专属
+	// http/tcpmux 专属
 	Locations         []string          `json:"locations,omitempty"`
 	HTTPUser          string            `json:"http_user,omitempty"`
 	HTTPPassword      string            `json:"http_password,omitempty"`
@@ -80,9 +139,36 @@ type ProxyConfig struct {
 	ResponseHeaders   map[string]string `json:"response_headers,omitempty"`
 	RouteByHTTPUser   string            `json:"route_by_http_user,omitempty"`
 
-	// stcp/xtcp
+	// tcpmux 专属
+	Multiplexer string `json:"multiplexer,omitempty"` // httpconnect (默认), httpconnect2
+
+	// 通用传输参数
+	UseEncryption        bool   `json:"use_encryption,omitempty"`
+	UseCompression       bool   `json:"use_compression,omitempty"`
+	BandwidthLimit       string `json:"bandwidth_limit,omitempty"`      // 如 "1MB"、"512KB",空表示不限速
+	BandwidthLimitMode   string `json:"bandwidth_limit_mode,omitempty"` // client (默认), server
+	ProxyProtocolVersion string `json:"proxy_protocol_version,omitempty"`
+
+	// 负载均衡分组
+	Group    string `json:"group,omitempty"`
+	GroupKey string `json:"group_key,omitempty"`
+
+	// 健康检查 (type 为空表示不检查)
+	HealthCheckType            string          `json:"health_check_type,omitempty"` // tcp, http
+	HealthCheckTimeoutSeconds  int             `json:"health_check_timeout_seconds,omitempty"`
+	HealthCheckMaxFailed       int             `json:"health_check_max_failed,omitempty"`
+	HealthCheckIntervalSeconds int             `json:"health_check_interval_seconds,omitempty"`
+	HealthCheckPath            string          `json:"health_check_path,omitempty"`
+	HealthCheckHTTPHeaders     []v1.HTTPHeader `json:"health_check_http_headers,omitempty"`
+
+	// stcp/xtcp/sudp
 	SecretKey  string   `json:"secret_key,omitempty"`
 	AllowUsers []string `json:"allow_users,omitempty"`
+
+	// xtcp 专属:禁用本地网卡地址辅助打洞
+	NatTraversalDisableAssistedAddrs bool `json:"nat_traversal_disable_assisted_addrs,omitempty"`
+
+	Metadatas map[string]string `json:"metadatas,omitempty"`
 }
 
 // CaddyModule 返回模块信息。
@@ -188,34 +274,95 @@ func (inst *Instance) build() error {
 
 // buildConfig 从 Instance 的内联字段构造 frp v1 配置对象。
 func (inst *Instance) buildConfig() (*v1.ClientCommonConfig, []v1.ProxyConfigurer, error) {
-	common := &v1.ClientCommonConfig{}
-
 	if inst.ServerAddr == "" {
 		return nil, nil, fmt.Errorf("server_addr is required")
 	}
+
+	switch inst.Protocol {
+	case "", "tcp", "kcp", "quic", "websocket", "wss":
+	default:
+		return nil, nil, fmt.Errorf("unsupported protocol %q (supported: tcp, kcp, quic, websocket, wss)", inst.Protocol)
+	}
+	switch inst.WireProtocol {
+	case "", "v1", "v2":
+	default:
+		return nil, nil, fmt.Errorf("unsupported wire_protocol %q (supported: v1, v2)", inst.WireProtocol)
+	}
+	switch inst.AuthMethod {
+	case "", "token", "oidc":
+	default:
+		return nil, nil, fmt.Errorf("unsupported auth_method %q (supported: token, oidc)", inst.AuthMethod)
+	}
+
+	common := &v1.ClientCommonConfig{}
 	common.ServerAddr = inst.ServerAddr
-	if inst.ServerPort > 0 {
-		common.ServerPort = inst.ServerPort
+	common.ServerPort = inst.ServerPort
+	common.User = inst.User
+	common.ClientID = inst.ClientID
+	common.DNSServer = inst.DNSServer
+	common.NatHoleSTUNServer = inst.NatHoleSTUNServer
+	common.UDPPacketSize = inst.UDPPacketSize
+	common.Metadatas = inst.Metadatas
+
+	// 认证
+	if inst.AuthMethod != "" {
+		common.Auth.Method = v1.AuthMethod(inst.AuthMethod)
 	}
-	if inst.User != "" {
-		common.User = inst.User
+	common.Auth.Token = inst.Token
+	if inst.OIDCClientID != "" || inst.OIDCTokenEndpointURL != "" {
+		common.Auth.OIDC = v1.AuthOIDCClientConfig{
+			ClientID:         inst.OIDCClientID,
+			ClientSecret:     inst.OIDCClientSecret,
+			Audience:         inst.OIDCAudience,
+			Scope:            inst.OIDCScope,
+			TokenEndpointURL: inst.OIDCTokenEndpointURL,
+		}
 	}
-	if inst.Token != "" {
-		common.Auth.Token = inst.Token
+
+	// 传输层
+	common.Transport.Protocol = inst.Protocol
+	common.Transport.WireProtocol = inst.WireProtocol
+	common.Transport.DialServerTimeout = inst.DialServerTimeout
+	common.Transport.DialServerKeepAlive = inst.DialServerKeepalive
+	common.Transport.ConnectServerLocalIP = inst.ConnectServerLocalIP
+	common.Transport.ProxyURL = inst.ProxyURL
+	common.Transport.PoolCount = inst.PoolCount
+	common.Transport.TCPMux = inst.TCPMux
+	common.Transport.TCPMuxKeepaliveInterval = inst.TCPMuxKeepaliveInterval
+	common.Transport.HeartbeatInterval = inst.HeartbeatInterval
+	common.Transport.HeartbeatTimeout = inst.HeartbeatTimeout
+	common.Transport.QUIC = v1.QUICOptions{
+		KeepalivePeriod:    inst.QUICKeepalivePeriod,
+		MaxIdleTimeout:     inst.QUICMaxIdleTimeout,
+		MaxIncomingStreams: inst.QUICMaxIncomingStreams,
 	}
-	if inst.Protocol != "" {
-		common.Transport.Protocol = inst.Protocol
+
+	// TLS
+	common.Transport.TLS.Enable = inst.TLSEnable
+	common.Transport.TLS.DisableCustomTLSFirstByte = inst.TLSDisableCustomFirstByte
+	common.Transport.TLS.CertFile = inst.TLSCertFile
+	common.Transport.TLS.KeyFile = inst.TLSKeyFile
+	common.Transport.TLS.TrustedCaFile = inst.TLSTrustedCaFile
+	common.Transport.TLS.ServerName = inst.TLSServerName
+
+	// 管理接口
+	common.WebServer = v1.WebServerConfig{
+		Addr:     inst.AdminAddr,
+		Port:     inst.AdminPort,
+		User:     inst.AdminUser,
+		Password: inst.AdminPassword,
 	}
-	if inst.LogLevel != "" {
-		common.Log.Level = inst.LogLevel
-	}
-	// LoginFailExit 始终为 false,确保连接失败时自动重试而非退出。
+
+	// 日志
+	common.Log.Level = inst.LogLevel
+
+	// LoginFailExit 默认 false,确保连接失败时自动重试而非退出。
 	// 这对 Caddy reload 时的重叠期(新实例等待旧实例释放端口)至关重要。
 	loginFailExit := false
-	common.LoginFailExit = &loginFailExit
-	if inst.TLSEnable != nil {
-		common.Transport.TLS.Enable = inst.TLSEnable
+	if inst.LoginFailExit != nil {
+		loginFailExit = *inst.LoginFailExit
 	}
+	common.LoginFailExit = &loginFailExit
 
 	if err := common.Complete(); err != nil {
 		return nil, nil, fmt.Errorf("complete common config: %w", err)
@@ -223,7 +370,7 @@ func (inst *Instance) buildConfig() (*v1.ClientCommonConfig, []v1.ProxyConfigure
 
 	// frp v0.69.1 起,proxy 的 user 前缀由 client 在生成 wire 消息时
 	// 通过 naming.AddUserPrefix 自动追加,这里无需再手动拼前缀。
-	var pxyCfgs []v1.ProxyConfigurer
+	pxyCfgs := make([]v1.ProxyConfigurer, 0, len(inst.proxies))
 	for _, p := range inst.proxies {
 		pcfg, err := buildProxyConf(p)
 		if err != nil {
@@ -240,71 +387,140 @@ func buildProxyConf(p ProxyConfig) (v1.ProxyConfigurer, error) {
 	if p.Name == "" {
 		return nil, fmt.Errorf("name is required")
 	}
+	if p.Type == "" {
+		p.Type = "tcp"
+	}
+
+	base, err := buildProxyBase(p)
+	if err != nil {
+		return nil, err
+	}
 
 	switch p.Type {
 	case "tcp":
-		return buildTCPProxy(p)
+		return buildTCPProxy(base, p)
 	case "udp":
-		return buildUDPProxy(p)
+		return buildUDPProxy(base, p)
 	case "http":
-		return buildHTTPProxy(p)
+		return buildHTTPProxy(base, p)
 	case "https":
-		return buildHTTPSProxy(p)
+		return buildHTTPSProxy(base, p)
+	case "tcpmux":
+		return buildTCPMuxProxy(base, p)
 	case "stcp":
-		return buildSTCPProxy(p)
+		return buildSTCPProxy(base, p)
 	case "xtcp":
-		return buildXTCPProxy(p)
+		return buildXTCPProxy(base, p)
+	case "sudp":
+		return buildSUDPProxy(base, p)
 	default:
-		return nil, fmt.Errorf("unsupported proxy type %q (supported: tcp, udp, http, https, stcp, xtcp)", p.Type)
+		return nil, fmt.Errorf("unsupported proxy type %q (supported: tcp, udp, http, https, tcpmux, stcp, xtcp, sudp)", p.Type)
 	}
 }
 
-func buildTCPProxy(p ProxyConfig) (*v1.TCPProxyConfig, error) {
+// buildProxyBase 构造所有代理类型共享的基础配置(后端地址、传输、负载均衡、健康检查等)。
+func buildProxyBase(p ProxyConfig) (*v1.ProxyBaseConfig, error) {
+	base := &v1.ProxyBaseConfig{}
+	base.Name = p.Name
+	base.Type = p.Type
+	base.Enabled = p.Enabled
+	base.LocalIP = p.LocalIP
+	base.LocalPort = p.LocalPort
+	base.Metadatas = p.Metadatas
+
+	// 传输参数
+	base.Transport.UseEncryption = p.UseEncryption
+	base.Transport.UseCompression = p.UseCompression
+	base.Transport.ProxyProtocolVersion = p.ProxyProtocolVersion
+	switch p.BandwidthLimitMode {
+	case "", types.BandwidthLimitModeClient, types.BandwidthLimitModeServer:
+		base.Transport.BandwidthLimitMode = p.BandwidthLimitMode
+	default:
+		return nil, fmt.Errorf("unsupported bandwidth_limit_mode %q (supported: client, server)", p.BandwidthLimitMode)
+	}
+	if p.BandwidthLimit != "" {
+		q, err := types.NewBandwidthQuantity(p.BandwidthLimit)
+		if err != nil {
+			return nil, fmt.Errorf("invalid bandwidth_limit %q: %w", p.BandwidthLimit, err)
+		}
+		base.Transport.BandwidthLimit = q
+	}
+	switch p.ProxyProtocolVersion {
+	case "", "v1", "v2":
+	default:
+		return nil, fmt.Errorf("unsupported proxy_protocol_version %q (supported: v1, v2)", p.ProxyProtocolVersion)
+	}
+
+	// 负载均衡分组
+	base.LoadBalancer.Group = p.Group
+	base.LoadBalancer.GroupKey = p.GroupKey
+
+	// 健康检查
+	if p.HealthCheckType != "" {
+		switch p.HealthCheckType {
+		case "tcp", "http":
+		default:
+			return nil, fmt.Errorf("unsupported health_check_type %q (supported: tcp, http)", p.HealthCheckType)
+		}
+		interval := p.HealthCheckIntervalSeconds
+		if interval <= 0 {
+			interval = 10
+		}
+		timeout := p.HealthCheckTimeoutSeconds
+		if timeout <= 0 {
+			timeout = 3
+		}
+		maxFailed := p.HealthCheckMaxFailed
+		if maxFailed <= 0 {
+			maxFailed = 1
+		}
+		base.HealthCheck = v1.HealthCheckConfig{
+			Type:            p.HealthCheckType,
+			TimeoutSeconds:  timeout,
+			MaxFailed:       maxFailed,
+			IntervalSeconds: interval,
+			Path:            p.HealthCheckPath,
+			HTTPHeaders:     p.HealthCheckHTTPHeaders,
+		}
+	}
+
+	return base, nil
+}
+
+func buildTCPProxy(base *v1.ProxyBaseConfig, p ProxyConfig) (v1.ProxyConfigurer, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
 	if p.RemotePort <= 0 {
 		return nil, fmt.Errorf("remote_port is required for tcp proxy")
 	}
-	cfg := &v1.TCPProxyConfig{}
-	cfg.Name = p.Name
-	cfg.Type = string(v1.ProxyTypeTCP)
-	cfg.LocalIP = p.LocalIP
-	cfg.LocalPort = p.LocalPort
+	cfg := &v1.TCPProxyConfig{ProxyBaseConfig: *base}
 	cfg.RemotePort = p.RemotePort
 	cfg.Complete()
 	return cfg, nil
 }
 
-func buildUDPProxy(p ProxyConfig) (*v1.UDPProxyConfig, error) {
+func buildUDPProxy(base *v1.ProxyBaseConfig, p ProxyConfig) (v1.ProxyConfigurer, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
 	if p.RemotePort <= 0 {
 		return nil, fmt.Errorf("remote_port is required for udp proxy")
 	}
-	cfg := &v1.UDPProxyConfig{}
-	cfg.Name = p.Name
-	cfg.Type = string(v1.ProxyTypeUDP)
-	cfg.LocalIP = p.LocalIP
-	cfg.LocalPort = p.LocalPort
+	cfg := &v1.UDPProxyConfig{ProxyBaseConfig: *base}
 	cfg.RemotePort = p.RemotePort
 	cfg.Complete()
 	return cfg, nil
 }
 
-func buildHTTPProxy(p ProxyConfig) (*v1.HTTPProxyConfig, error) {
+func buildHTTPProxy(base *v1.ProxyBaseConfig, p ProxyConfig) (v1.ProxyConfigurer, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
 	if len(p.CustomDomains) == 0 && p.SubDomain == "" {
 		return nil, fmt.Errorf("custom_domains or sub_domain is required for http proxy")
 	}
-	cfg := &v1.HTTPProxyConfig{}
-	cfg.Name = p.Name
-	cfg.Type = string(v1.ProxyTypeHTTP)
-	cfg.LocalIP = p.LocalIP
-	cfg.LocalPort = p.LocalPort
+	cfg := &v1.HTTPProxyConfig{ProxyBaseConfig: *base}
 	cfg.CustomDomains = p.CustomDomains
 	cfg.SubDomain = p.SubDomain
 	cfg.Locations = p.Locations
@@ -318,54 +534,77 @@ func buildHTTPProxy(p ProxyConfig) (*v1.HTTPProxyConfig, error) {
 	return cfg, nil
 }
 
-func buildHTTPSProxy(p ProxyConfig) (*v1.HTTPSProxyConfig, error) {
+func buildHTTPSProxy(base *v1.ProxyBaseConfig, p ProxyConfig) (v1.ProxyConfigurer, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
 	if len(p.CustomDomains) == 0 && p.SubDomain == "" {
 		return nil, fmt.Errorf("custom_domains or sub_domain is required for https proxy")
 	}
-	cfg := &v1.HTTPSProxyConfig{}
-	cfg.Name = p.Name
-	cfg.Type = string(v1.ProxyTypeHTTPS)
-	cfg.LocalIP = p.LocalIP
-	cfg.LocalPort = p.LocalPort
+	cfg := &v1.HTTPSProxyConfig{ProxyBaseConfig: *base}
 	cfg.CustomDomains = p.CustomDomains
 	cfg.SubDomain = p.SubDomain
 	cfg.Complete()
 	return cfg, nil
 }
 
-func buildSTCPProxy(p ProxyConfig) (*v1.STCPProxyConfig, error) {
+func buildTCPMuxProxy(base *v1.ProxyBaseConfig, p ProxyConfig) (v1.ProxyConfigurer, error) {
+	if p.LocalPort <= 0 {
+		return nil, fmt.Errorf("local_port is required")
+	}
+	if len(p.CustomDomains) == 0 && p.SubDomain == "" {
+		return nil, fmt.Errorf("custom_domains or sub_domain is required for tcpmux proxy")
+	}
+	cfg := &v1.TCPMuxProxyConfig{ProxyBaseConfig: *base}
+	cfg.CustomDomains = p.CustomDomains
+	cfg.SubDomain = p.SubDomain
+	cfg.HTTPUser = p.HTTPUser
+	cfg.HTTPPassword = p.HTTPPassword
+	cfg.RouteByHTTPUser = p.RouteByHTTPUser
+	cfg.Multiplexer = p.Multiplexer
+	cfg.Complete()
+	return cfg, nil
+}
+
+func buildSTCPProxy(base *v1.ProxyBaseConfig, p ProxyConfig) (v1.ProxyConfigurer, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
 	if p.SecretKey == "" {
 		return nil, fmt.Errorf("secret_key is required for stcp proxy")
 	}
-	cfg := &v1.STCPProxyConfig{}
-	cfg.Name = p.Name
-	cfg.Type = string(v1.ProxyTypeSTCP)
-	cfg.LocalIP = p.LocalIP
-	cfg.LocalPort = p.LocalPort
+	cfg := &v1.STCPProxyConfig{ProxyBaseConfig: *base}
 	cfg.Secretkey = p.SecretKey
 	cfg.AllowUsers = p.AllowUsers
 	cfg.Complete()
 	return cfg, nil
 }
 
-func buildXTCPProxy(p ProxyConfig) (*v1.XTCPProxyConfig, error) {
+func buildXTCPProxy(base *v1.ProxyBaseConfig, p ProxyConfig) (v1.ProxyConfigurer, error) {
 	if p.LocalPort <= 0 {
 		return nil, fmt.Errorf("local_port is required")
 	}
 	if p.SecretKey == "" {
 		return nil, fmt.Errorf("secret_key is required for xtcp proxy")
 	}
-	cfg := &v1.XTCPProxyConfig{}
-	cfg.Name = p.Name
-	cfg.Type = string(v1.ProxyTypeXTCP)
-	cfg.LocalIP = p.LocalIP
-	cfg.LocalPort = p.LocalPort
+	cfg := &v1.XTCPProxyConfig{ProxyBaseConfig: *base}
+	cfg.Secretkey = p.SecretKey
+	cfg.AllowUsers = p.AllowUsers
+	if p.NatTraversalDisableAssistedAddrs {
+		cfg.NatTraversal = &v1.NatTraversalConfig{DisableAssistedAddrs: true}
+	}
+	cfg.Complete()
+	return cfg, nil
+}
+
+func buildSUDPProxy(base *v1.ProxyBaseConfig, p ProxyConfig) (v1.ProxyConfigurer, error) {
+	if p.LocalPort <= 0 {
+		return nil, fmt.Errorf("local_port is required")
+	}
+	if p.SecretKey == "" {
+		return nil, fmt.Errorf("secret_key is required for sudp proxy")
+	}
+	cfg := &v1.SUDPProxyConfig{ProxyBaseConfig: *base}
 	cfg.Secretkey = p.SecretKey
 	cfg.AllowUsers = p.AllowUsers
 	cfg.Complete()

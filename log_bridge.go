@@ -4,8 +4,8 @@ import (
 	"strings"
 	"time"
 
-	goliblog "github.com/fatedier/golib/log"
 	frplog "github.com/fatedier/frp/pkg/util/log"
+	goliblog "github.com/fatedier/golib/log"
 
 	"go.uber.org/zap"
 )
